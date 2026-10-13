@@ -63,3 +63,23 @@ __global__ void conv2d_tiled(const unsigned int *__restrict__ in, unsigned int *
     }
     out[y * W + x] = conv_to_pixel(sum);
 }
+// Host helper: flip k (F x F) and upload to constant memory.
+static inline cudaError_t upload_flipped_filter(const float *k, int F) {
+    float flipped[MAX_FILTER * MAX_FILTER];
+    for (int a = 0; a < F; a++)
+        for (int b = 0; b < F; b++)
+            flipped[a * F + b] = k[(F - 1 - a) * F + (F - 1 - b)];
+    return cudaMemcpyToSymbol(c_filter, flipped, F * F * sizeof(float));
+}
+
+static inline void launch_conv(bool tiled, const unsigned int *d_in, unsigned int *d_out,
+                               int W, int H, int F) {
+    dim3 block(CONV_TILE, CONV_TILE);
+    dim3 grid((W + CONV_TILE - 1) / CONV_TILE, (H + CONV_TILE - 1) / CONV_TILE);
+    if (tiled) {
+        size_t smem = (size_t)(CONV_TILE + F - 1) * (CONV_TILE + F - 1) * sizeof(unsigned int);
+        conv2d_tiled<<<grid, block, smem>>>(d_in, d_out, W, H, F);
+    } else {
+        conv2d_naive<<<grid, block>>>(d_in, d_out, W, H, F);
+    }
+}
