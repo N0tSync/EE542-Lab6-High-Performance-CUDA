@@ -31,3 +31,35 @@ __global__ void conv2d_naive(const unsigned int *__restrict__ in, unsigned int *
     }
     out[y * W + x] = conv_to_pixel(sum);
 }
+
+// Tiled: each 16x16 block cooperatively loads its (16+F-1)^2 input patch,
+// halo included, into shared memory once; then every output pixel reads its
+// F*F neighbourhood from shared memory. Filter lives in constant memory, which
+// is broadcast to all threads of a warp since they read the same coefficient.
+// Launch with dynamic shared memory = (CONV_TILE+F-1)^2 * sizeof(unsigned int).
+__global__ void conv2d_tiled(const unsigned int *__restrict__ in, unsigned int *__restrict__ out,
+                             int W, int H, int F) {
+    extern __shared__ unsigned int tile[];
+    const int L  = F - 1 - F / 2;
+    const int TW = CONV_TILE + F - 1;
+    const int ox = blockIdx.x * CONV_TILE;
+    const int oy = blockIdx.y * CONV_TILE;
+    const int tid = threadIdx.y * CONV_TILE + threadIdx.x;
+
+    for (int i = tid; i < TW * TW; i += CONV_TILE * CONV_TILE) {
+        int ty = i / TW, tx = i % TW;
+        int gy = oy + ty - L, gx = ox + tx - L;
+        tile[i] = (gy >= 0 && gy < H && gx >= 0 && gx < W) ? in[gy * W + gx] : 0u;
+    }
+    __syncthreads();
+
+    int x = ox + threadIdx.x, y = oy + threadIdx.y;
+    if (x >= W || y >= H) return;
+    float sum = 0.0f;
+    for (int a = 0; a < F; a++) {
+        const unsigned int *row = &tile[(threadIdx.y + a) * TW + threadIdx.x];
+        for (int b = 0; b < F; b++)
+            sum += c_filter[a * F + b] * (float)row[b];
+    }
+    out[y * W + x] = conv_to_pixel(sum);
+}
