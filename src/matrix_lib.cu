@@ -135,3 +135,96 @@ done:
     g_total_ms = (float)(wall_ms() - t0);
     return rc;
 }
+
+// ---------------------------------------------------------------- exports
+extern "C" {
+
+int gpu_matrix_multiply(const float *h_A, const float *h_B, float *h_C, int N) {
+    return matmul_common(h_A, h_B, h_C, N, MM_TILED);
+}
+
+int gpu_matrix_multiply_opt(const float *h_A, const float *h_B, float *h_C, int N) {
+    return matmul_common(h_A, h_B, h_C, N, MM_OPT);
+}
+
+int gpu_matrix_multiply_cublas(const float *h_A, const float *h_B, float *h_C, int N) {
+    return matmul_common(h_A, h_B, h_C, N, MM_CUBLAS);
+}
+
+int gpu_convolve(const unsigned int *h_in, unsigned int *h_out, int W, int H,
+                 const float *h_filter, int F, int tiled) {
+    int rc = 0;
+    double t0 = wall_ms();
+    size_t bytes = (size_t)W * H * sizeof(unsigned int);
+    unsigned int *d_in = nullptr, *d_out = nullptr;
+    EventTimer t;
+    if (F < 1 || F > MAX_FILTER) { fprintf(stderr, "libmatrix: filter size %d unsupported (1..%d)\n", F, MAX_FILTER); return -1; }
+
+    TRY(cudaMalloc((void **)&d_in, bytes));
+    TRY(cudaMalloc((void **)&d_out, bytes));
+    TRY(upload_flipped_filter(h_filter, F));
+    TRY(cudaMemcpy(d_in, h_in, bytes, cudaMemcpyHostToDevice));
+    t.start();
+    launch_conv(tiled != 0, d_in, d_out, W, H, F);
+    TRY(cudaGetLastError());
+    g_kernel_ms = t.stop();
+    TRY(cudaMemcpy(h_out, d_out, bytes, cudaMemcpyDeviceToHost));
+done:
+    cudaFree(d_in); cudaFree(d_out);
+    g_total_ms = (float)(wall_ms() - t0);
+    return rc;
+}
+
+// Apply nfilters F x F filters (stored back to back) to one image. The image is
+// copied to the GPU once, so this amortises the transfer overhead — the main
+// lesson of Part 5 applied to the library API. out holds nfilters images.
+int gpu_convolve_batch(const unsigned int *h_in, unsigned int *h_out, int W, int H,
+                       const float *h_filters, int F, int nfilters) {
+    int rc = 0;
+    double t0 = wall_ms();
+    size_t bytes = (size_t)W * H * sizeof(unsigned int);
+    unsigned int *d_in = nullptr, *d_out = nullptr;
+    float kms = 0;
+    if (F < 1 || F > MAX_FILTER) { fprintf(stderr, "libmatrix: filter size %d unsupported (1..%d)\n", F, MAX_FILTER); return -1; }
+
+    TRY(cudaMalloc((void **)&d_in, bytes));
+    TRY(cudaMalloc((void **)&d_out, bytes * nfilters));
+    TRY(cudaMemcpy(d_in, h_in, bytes, cudaMemcpyHostToDevice));
+    for (int f = 0; f < nfilters; f++) {
+        EventTimer t;
+        TRY(upload_flipped_filter(h_filters + (size_t)f * F * F, F));
+        t.start();
+        launch_conv(true, d_in, d_out + (size_t)f * W * H, W, H, F);
+        TRY(cudaGetLastError());
+        kms += t.stop();
+    }
+    g_kernel_ms = kms;
+    TRY(cudaMemcpy(h_out, d_out, bytes * nfilters, cudaMemcpyDeviceToHost));
+done:
+    cudaFree(d_in); cudaFree(d_out);
+    g_total_ms = (float)(wall_ms() - t0);
+    return rc;
+}
+
+float gpu_last_kernel_ms(void) { return g_kernel_ms; }
+float gpu_last_total_ms(void)  { return g_total_ms; }
+
+int gpu_device_name(char *buf, int len) {
+    cudaDeviceProp p;
+    int dev = 0;
+    cudaError_t e = cudaGetDevice(&dev);
+    if (e == cudaSuccess) e = cudaGetDeviceProperties(&p, dev);
+    if (e != cudaSuccess) return (int)e;
+    snprintf(buf, len, "%s", p.name);
+    return 0;
+}
+
+int gpu_warmup(void) {
+    cudaError_t e = cudaFree(0);   // creates the context
+    if (e != cudaSuccess) return (int)e;
+    if (!g_cublas && cublasCreate(&g_cublas) == CUBLAS_STATUS_SUCCESS)
+        cublasSetMathMode(g_cublas, CUBLAS_DEFAULT_MATH);
+    return 0;
+}
+
+}  // extern "C"
