@@ -3,52 +3,35 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-IMAGES=${IMAGES:-"data/testcard_512.bin data/testcard_1024.bin data/testcard_2048.bin data/testcard_4096.bin"}
-FILTERS=${FILTERS:-"filters/box3.txt filters/box9.txt filters/box15.txt"}
-OUT=results/conv.csv
-mkdir -p results out
+CPU_SIZES=${CPU_SIZES:-"64 128 256 384 512 768 1024 1536 2048"}
+GPU_SIZES=${GPU_SIZES:-"64 128 256 384 512 768 1024 1536 2048 3072 4096 6144 8192"}
+REPS=${REPS:-5}
+OUT=${OUT:-results/matmul.csv}
 
-for f in $IMAGES; do [[ -f $f ]] || { echo "missing $f — run: python3 tools/img_tools.py samples data/"; exit 1; }; done
+mkdir -p results
+echo "impl,N,kernel_ms,total_ms,gflops,max_rel_err" > "$OUT"
 
-echo "impl,M,F,kernel_ms,total_ms,process_ms" > "$OUT"
-rm -f results/conv_python.csv
-
-ms_now() { date +%s%N | awk '{printf "%.3f", $1/1e6}'; }
-
-run() {   # run <name-for-log> <cmd...>; records the RESULT line plus whole-process wall time
-    local t0 t1 line
-    t0=$(ms_now)
-    line=$("${@:2}" | grep '^RESULT,') || { echo "!! failed: ${*:2}" >&2; return; }
-    t1=$(ms_now)
-    echo "${line#RESULT,},$(awk -v a="$t0" -v b="$t1" 'BEGIN{printf "%.3f", b-a}')" >> "$OUT"
-    echo "  $1: ${line#RESULT,}"
+run() {   # run <binary> <args...>  -> append its RESULT line
+    local line
+    if line=$("$@" | tee /dev/stderr | grep '^RESULT,'); then
+        echo "${line#RESULT,}" >> "$OUT"
+    else
+        echo "!! failed: $*" >&2
+    fi
 }
 
-fails=0
-for img in $IMAGES; do
-    for flt in $FILTERS; do
-        tag="$(basename "$img" .bin)_$(basename "$flt" .txt)"
-        echo "== $tag =="
-        run "C       " build/conv_cpu "$img" "$flt" "out/${tag}_cpu.bin"
-        if [[ -x build/conv_gpu ]]; then
-            run "CUDA nai" build/conv_gpu "$img" "$flt" "out/${tag}_gpu_naive.bin" 10 naive
-            run "CUDA til" build/conv_gpu "$img" "$flt" "out/${tag}_gpu.bin" 10 tiled
-            python3 tools/img_tools.py diff "out/${tag}_cpu.bin" "out/${tag}_gpu.bin" || fails=$((fails+1))
-        fi
-    done
-done
-
-if [[ -f build/libmatrix.so ]]; then
-    echo "== Python -> libmatrix.so =="
-    # shellcheck disable=SC2086
-    python3 python/conv_py.py bench --images $IMAGES --filters $FILTERS --numpy \
-        --save out --csv results/conv_python.csv
-    for img in $IMAGES; do for flt in $FILTERS; do
-        tag="$(basename "$img" .bin)_$(basename "$flt" .txt)"
-        python3 tools/img_tools.py diff "out/${tag}_cpu.bin" "out/${tag}_py.bin" || fails=$((fails+1))
-    done; done
+echo "== CPU (C) =="
+for N in $CPU_SIZES; do run build/matrix_cpu "$N" ijk; done
+if [[ "${CPU_IKJ:-1}" == 1 ]]; then
+    for N in $CPU_SIZES; do run build/matrix_cpu "$N" ikj; done
 fi
 
+for bin in matrix_gpu matrix_tiled matrix_tiled32 matrix_opt matrix_cublas; do
+    [[ -x build/$bin ]] || { echo "skipping $bin (not built)"; continue; }
+    echo "== $bin =="
+    for N in $GPU_SIZES; do run "build/$bin" "$N" "$REPS"; done
+done
+
 echo
-[[ $fails == 0 ]] && echo "All outputs match (|diff| <= 1)." || echo "!! $fails output comparisons FAILED"
-echo "Wrote $OUT and results/conv_python.csv. Next: python3 scripts/plot_results.py"
+echo "Wrote $OUT. Next: python3 python/matrix_py.py --sizes 512 1024 2048 4096 --csv results/matmul_python.csv"
+echo "      then:  python3 scripts/plot_results.py"
